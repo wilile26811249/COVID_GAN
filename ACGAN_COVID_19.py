@@ -1,4 +1,3 @@
-import enum
 import os
 import argparse
 import numpy as np
@@ -16,18 +15,19 @@ os.makedirs("weights", exist_ok = True)
 os.makedirs("samples", exist_ok = True)
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--epochs", type = int, default = 5000, help = "Number of epochs for training")
+parser.add_argument("--epochs", type = int, default = 50, help = "Number of epochs for training")
 parser.add_argument("--batch-size", type = int, default = 32, help = "Size of each batches")
 parser.add_argument("--classes", type = int, default = 4, help = "Number of classes for your dataset")
-parser.add_argument("--latent-dim", type = int, default = 110, help = "Dimension of the latent vector")
+parser.add_argument("--latent-dim", type = int, default = 100, help = "Dimension of the latent vector")
 parser.add_argument("--img-size", type = int, default = 128, help = "Size of each img dimension")
 parser.add_argument("--img-channel", type = int, default = 3, help = "Number of the channel for the image")
-parser.add_argument("--data-dir", type = str, default = "/data", help = "Data root dir of your training data")
+parser.add_argument("--data-dir", type = str, default = "data/radiography/", help = "Data root dir of your training data")
 parser.add_argument("--sample-interval", type = int, default = 100, help = "Interval for sampling image from generator")
 parser.add_argument("--gpu-id", type = int, default = 1, help = "Select the specific gpu to training")
 arg = parser.parse_args()
 print(f"Training Hyperparameters: {arg}")
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 cuda = True if torch.cuda.is_available() else False
 device = torch.device("cuda" if cuda else "cpu")
 
@@ -60,7 +60,7 @@ class Generator(nn.Module):
                 nn.LeakyReLU(0.2, inplace = True)
             )
         self.label_to_latent = nn.Embedding(arg.classes, arg.latent_dim)
-        self.init_img_size = arg.img_size // 8
+        self.init_img_size = arg.img_size // 16
         self.layer1 = nn.Linear(arg.latent_dim, 768 * self.init_img_size ** 2)
         self.layer2 = nn.Sequential(
             generator_block(768, 384),   # (768,  8,  8) -> (384, 16, 16)
@@ -113,7 +113,10 @@ class Discriminator(nn.Module):
             nn.Linear(512 * self.downsample_size ** 2, 1),
             nn.Sigmoid()
         )
-        self.classifier_layer = nn.Linear(512 * self.downsample_size ** 2, arg.classes)
+        self.classifier_layer = nn.Sequential(
+            nn.Linear(512 * self.downsample_size ** 2, arg.classes),
+            nn.Softmax()
+        )
 
     def forward(self, img):
         out = self.conv_block(img)
@@ -139,20 +142,26 @@ if cuda:
     auxiliary_loss.cuda()
 
 # Initialize optimizer for generator and discriminator
-optim_G = torch.optim.Adam(netG.parameters(), lr = 0.0002, beta = (0.5, 0.999))
-optim_D = torch.optim.Adam(netD.parameters(), lr = 0.0002, beta = (0.5, 0.999))
+optim_G = torch.optim.Adam(netG.parameters(), lr = 0.0002, betas = (0.5, 0.999))
+optim_D = torch.optim.Adam(netD.parameters(), lr = 0.0002, betas = (0.5, 0.999))
 
 FloatTensor = torch.cuda.FloatTensor if cuda else torch.FloatTensor
 LongTensor = torch.cuda.LongTensor if cuda else torch.LongTensor
 
 
 def generate_img(n_row, steps):
-    z = Variable(FloatTensor(np.random.normal(0, 1, (n_row ** 2, arg.latent_dim))))
+    z = Variable(torch.randn(n_row * arg.classes, arg.latent_dim)).to("cuda")
     # Get labels ranging from 0 to n_classes for n rows
-    labels = np.array([num for _ in range(n_row) for num in range(n_row)])
+    labels = np.array([class_label for class_label in range(arg.classes) for num in range(n_row)])
     labels = Variable(LongTensor(labels))
     gen_imgs = netG(z, labels)
-    torch.utils.save_image(gen_imgs.data, "samples/%d.png" % steps, nrow = n_row, normalize = True)
+    inv_normalize = T.Normalize(
+       mean=[-0.485/0.229, -0.456/0.224, -0.406/0.255],
+      std=[1/0.229, 1/0.224, 1/0.255]
+    )
+    gen_imgs = inv_normalize(gen_imgs)
+    save_imgs = torchvision.utils.make_grid(gen_imgs.data, 4)
+    torchvision.utils.save_image(save_imgs, "samples/%d.png" % steps, normalize = True)
 
 
 # Configure dataloader
@@ -188,7 +197,7 @@ for epoch in range(arg.epochs):
         # Train Generator
         #--------------------
         # Generate noise and label
-        z = Variable(torch.randn(batch_size)).to(device)
+        z = Variable(torch.randn(batch_size, arg.latent_dim)).to(device)
         gen_labels = Variable(LongTensor(np.random.randint(0, arg.classes, batch_size)))
 
         # Generate images
@@ -196,7 +205,8 @@ for epoch in range(arg.epochs):
 
         # Loss measures generator's ability to fool the discriminator
         fake_adv, fake_aux = netD(gen_imgs)
-        g_loss = 0.5 * (adversarial_loss(fake_adv, real) + auxiliary_loss(fake_aux, gen_labels))
+        #real = real.view(-1, 1)
+        g_loss = 0.5 * (adversarial_loss(fake_adv, real.view(-1, 1)) + auxiliary_loss(fake_aux, gen_labels))
 
         g_loss.backward()
         optim_G.step()
@@ -209,11 +219,11 @@ for epoch in range(arg.epochs):
 
         # Loss for real images
         real_adv, real_aux = netD(real_imgs)
-        d_real_loss = (adversarial_loss(real_adv, real) + auxiliary_loss(real_aux, labels)) / 2
+        d_real_loss = (adversarial_loss(real_adv, real.view(-1, 1)) + auxiliary_loss(real_aux, labels)) / 2
 
         # Loss for fake images
         fake_adv, fake_aux = netD(gen_imgs.detach())
-        d_fake_loss = (adversarial_loss(fake_adv, fake) + auxiliary_loss(fake_aux, gen_labels)) / 2
+        d_fake_loss = (adversarial_loss(fake_adv, fake.view(-1, 1)) + auxiliary_loss(fake_aux, gen_labels)) / 2
 
         # Total discriminator loss
         d_loss = d_real_loss + d_fake_loss
@@ -226,11 +236,11 @@ for epoch in range(arg.epochs):
         d_loss.backward()
         optim_D.step()
 
-    print(
-        "[Epoch %d/%d] [Batch %d/%d] [D loss: %f, acc: %d%%] [G loss: %f]"
-        % (epoch, arg.epochs, i, len(covid_dataloader), d_loss.item(), 100 * d_acc, g_loss.item())
-    )
+        print(
+            "[Epoch %d/%d] [Batch %d/%d] [D loss: %f, acc: %d%%] [G loss: %f]"
+            % (epoch, arg.epochs, i, len(covid_dataloader), d_loss.item(), 100 * d_acc, g_loss.item())
+        )
 
-    steps = epoch * len(covid_dataloader) + i
-    if steps % arg.sample_interval == 0:
-        generate_img(n_row = 10, steps = steps)
+        steps = epoch * len(covid_dataloader) + i
+        if steps % arg.sample_interval == 0:
+            generate_img(n_row = 4, steps = steps)
